@@ -1,0 +1,49 @@
+# Development runner: bind-mounts this directory so code edits do not require
+# rebuilding an image. Deno's watcher restarts the server when server.ts changes.
+services:
+  responses-images-proxy:
+    image: denoland/deno:2.6.5
+    working_dir: /app
+    command:
+      - run
+      - --watch=server.ts
+      - --no-clear-screen
+      - --allow-net
+      - --allow-env
+      - server.ts
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    environment:
+      DENO_DIR: /deno-dir
+      HOST: "${HOST:-0.0.0.0}"
+      PORT: "${PORT:-8000}"
+      UPSTREAM_BASE_URL: "${UPSTREAM_BASE_URL:-}"
+      UPSTREAM_API_KEY: "${UPSTREAM_API_KEY:-}"
+      PROXY_API_KEY: "${PROXY_API_KEY:-}"
+      DEFAULT_MODEL: "${DEFAULT_MODEL:-gpt-5.3-codex}"
+      UPSTREAM_IMAGE_OUTPUT_FORMAT: "${UPSTREAM_IMAGE_OUTPUT_FORMAT:-png}"
+      IMAGE_RACE_CONCURRENCY: "${IMAGE_RACE_CONCURRENCY:-1}"
+      MAX_IMAGE_RACE_CONCURRENCY: "${MAX_IMAGE_RACE_CONCURRENCY:-4}"
+      MAX_TOTAL_UPSTREAM_CALLS: "${MAX_TOTAL_UPSTREAM_CALLS:-8}"
+      MAX_IMAGE_UPSTREAM_CONCURRENCY: "${MAX_IMAGE_UPSTREAM_CONCURRENCY:-4}"
+      MAX_OUTPUT_IMAGES: "${MAX_OUTPUT_IMAGES:-4}"
+      UPSTREAM_TIMEOUT_MS: "${UPSTREAM_TIMEOUT_MS:-180000}"
+      MAX_ERROR_BODY_BYTES: "${MAX_ERROR_BODY_BYTES:-8192}"
+      MAX_REQUEST_BYTES: "${MAX_REQUEST_BYTES:-83886080}"
+      MAX_INPUT_IMAGE_BYTES: "${MAX_INPUT_IMAGE_BYTES:-26214400}"
+      MAX_INPUT_IMAGES: "${MAX_INPUT_IMAGES:-8}"
+      ALLOW_REMOTE_IMAGE_URLS: "${ALLOW_REMOTE_IMAGE_URLS:-false}"
+      CORS_ALLOW_ORIGIN: "${CORS_ALLOW_ORIGIN:-*}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      LOG_SSE_DATA: "${LOG_SSE_DATA:-false}"
+      IMAGE_PARTIAL_FALLBACK: "${IMAGE_PARTIAL_FALLBACK:-false}"
+    volumes:
+      - type: bind
+        source: .
+        target: /app
+      - type: volume
+        source: deno-cache
+        target: /deno-dir
+
+volumes:
+  deno-cache:
