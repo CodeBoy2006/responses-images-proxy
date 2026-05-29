@@ -902,7 +902,7 @@ async function parseImageRequest(req: Request, mode: "generation" | "edit" | "va
 }
 
 const UPSTREAM_IMAGE_RETRY_INSTRUCTION =
-  "如果图片生成工具调用没有产出图片，请根据情况合理改写提示词，再尝试调用一次 image_generation 工具。";
+  "**重要指示：如果图片生成工具调用没有产出图片，请根据情况合理改写提示词，再尝试调用一次 image_generation 工具，直至成功生成图片，否则继续重试，不得中途停止**";
 
 const UPSTREAM_IMAGE_SYSTEM_PROMPT = [
   "你是一个专业的图片生成代理。你的首要目标是通过 image_generation 工具直接产出图片，而不是用文字描述图片。",
