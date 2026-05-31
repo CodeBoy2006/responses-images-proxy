@@ -306,7 +306,8 @@ function configureRuntime(bindings?: RuntimeEnvBindings): AppConfig {
 
 const LOG_ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 function printPrettyDivider(label: string): void {
-  console.log(`<${label}>`);
+  const coloredLabel = `\x1b[35m${label}\x1b[0m`;
+  console.log(`    <${coloredLabel}>`);
 }
 
 function log(level: LogLevel, message: string, fields: Record<string, unknown> = {}): void {
