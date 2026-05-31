@@ -138,6 +138,8 @@ interface AppConfig {
   allowRemoteImageUrls: boolean;
   corsAllowOrigin: string;
   logLevel: LogLevel;
+  // If true, use human-friendly, colored terminal output instead of JSON.
+  prettyLogs: boolean;
   logSseData: boolean;
   imagePartialFallback: boolean;
 }
@@ -286,6 +288,9 @@ function buildConfig(): AppConfig {
     corsAllowOrigin: env("CORS_ALLOW_ORIGIN", "*"),
     logLevel: (env("LOG_LEVEL", "info").toLowerCase() as LogLevel),
     logSseData: boolEnv("LOG_SSE_DATA", false),
+    // When true, logs are printed in a human-friendly, colored format
+    // instead of compact JSON lines. Enable with LOG_PRETTY=true.
+    prettyLogs: boolEnv("LOG_PRETTY", false),
     imagePartialFallback: boolEnv("IMAGE_PARTIAL_FALLBACK", false),
   };
 }
@@ -303,6 +308,44 @@ const LOG_ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, err
 
 function log(level: LogLevel, message: string, fields: Record<string, unknown> = {}): void {
   if (LOG_ORDER[level] < LOG_ORDER[CONFIG.logLevel]) return;
+  // Pretty terminal output when enabled in config
+  if (CONFIG.prettyLogs) {
+    const ts = new Date().toISOString();
+    const colorMap: Record<LogLevel, string> = {
+      debug: "\x1b[36m", // cyan
+      info: "\x1b[32m", // green
+      warn: "\x1b[33m", // yellow
+      error: "\x1b[31m", // red
+    };
+    const reset = "\x1b[0m";
+
+    const fmtValue = (v: unknown): string => {
+      if (v === null) return "null";
+      if (v === undefined) return "undefined";
+      if (typeof v === "string") return v;
+      if (typeof v === "number" || typeof v === "boolean") return String(v);
+      try {
+        return JSON.stringify(v);
+      } catch {
+        return String(v as any);
+      }
+    };
+
+    const fieldsStr = Object.keys(fields).length
+      ? " " + Object.entries(fields).map(([k, v]) => `${k}=${fmtValue(v)}`).join(" ")
+      : "";
+
+    const levelLabel = level.toUpperCase();
+    const coloredLevel = (colorMap[level] || "") + levelLabel + reset;
+    const line = `[${ts}] ${coloredLevel} ${message}${fieldsStr}`;
+
+    if (level === "error") console.error(line);
+    else if (level === "warn") console.warn(line);
+    else console.log(line);
+    return;
+  }
+
+  // Default: compact JSON log lines for structured logging
   const entry = {
     ts: new Date().toISOString(),
     level,
