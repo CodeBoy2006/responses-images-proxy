@@ -10,6 +10,22 @@
 //   PROXY_API_KEY="local-secret" \
 //   deno run --allow-net --allow-env v1_images_server_no_file_storage.ts
 //
+// Multi-backend hedging:
+//   UPSTREAM_BACKENDS='[
+//     {"name":"a","base_url":"https://a.example.com","api_key":"sk-a"},
+//     {"name":"b","base_url":"https://b.example.com","api_key":"sk-b"}
+//   ]'
+//   # or: UPSTREAM_BASE_URLS="https://a.example.com,https://b.example.com"
+//   #     UPSTREAM_API_KEYS="sk-a,sk-b"
+//
+// Blank-image padding for fragile direct generation channels:
+//   IMAGE_BLANK_PADDING_ENABLED=true   # default true for /v1/images/generations
+//   IMAGE_BLANK_PADDING_ACTION=edit     # default edit; set auto if your upstream dislikes edit
+//
+// Responses compatibility:
+//   POST /v1/responses is also proxied, so the companion HTML can use this
+//   server as its Base URL. IMAGE_INCLUDE_TOOL_CHOICE=false by default to match it.
+//
 // Optional style plugin:
 //   IMAGE_STYLE_PLUGIN="realistic"            # reads ./styles/realistic.txt
 //   IMAGE_STYLE_PLUGIN_DIR="./styles"
@@ -31,12 +47,23 @@ interface GeneratedImage {
   upstreamElapsedMs: number;
   winningAttempt: number;
   raceGroup: number;
+  upstreamName: string;
+  upstreamBaseUrl: string;
 }
 
 const IMAGE_TOOL_ACTIONS = ["auto", "generate", "edit"] as const;
 const IMAGE_TOOL_BACKGROUNDS = ["auto", "opaque", "transparent"] as const;
 const IMAGE_TOOL_MODERATIONS = ["auto", "low"] as const;
 const IMAGE_TOOL_INPUT_FIDELITIES = ["high", "low"] as const;
+
+// 1024x1024 white PNG used to turn fragile text-to-image requests into
+// image-conditioned requests for upstreams/channels that are better at edits.
+const DEFAULT_BLANK_IMAGE_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABAAAAAQACAIAAADwf7zUAAARhklEQVR42u3XMQEAAAzCMPybBh9bIqFfUwAA4I1IAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAADAAEgAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAMAASAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAwABIAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAMAAAAYAAAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAGAAAAMAAAAIABAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAADAAAAGAAAAMAAAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAADAAAAGAAAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAABgAAADAAAACAAQAAAAwAAABgAAAAAAMAAAAYAAAAwAAAAAAGAAAAMAAAAIABAAAAAwAAABgAAADAAAAAAAYAAAAwAAAAgAEAAAAMAAAAYAAAAAADAAAAGAAAAMAAAACAAQAAAAwAAABwywCBdc1PdKKEQgAAAABJRU5ErkJggg==";
+
+function normalizeImageToolActionEnv(value: string, fallback: ImageToolAction): ImageToolAction {
+  const s = String(value || "").trim().toLowerCase();
+  return (IMAGE_TOOL_ACTIONS as readonly string[]).includes(s) ? s as ImageToolAction : fallback;
+}
 
 type ImageToolAction = typeof IMAGE_TOOL_ACTIONS[number];
 type ImageToolBackground = typeof IMAGE_TOOL_BACKGROUNDS[number];
@@ -89,6 +116,7 @@ interface ParsedImageRequest {
   inputImageMask?: ImageToolInputMask;
   outputCompression?: number;
   partialImages: number;
+  blankImagePadding: boolean;
   size?: string;
   quality?: string;
   stylePlugin?: StylePlugin;
@@ -140,6 +168,12 @@ interface LenientImageBatchResult {
 type RuntimeKind = "cloudflare-worker" | "deno-deploy" | "deno-local" | "unknown-edge";
 type RuntimeEnvBindings = Record<string, unknown>;
 
+interface UpstreamBackend {
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+}
+
 interface RuntimeInfo {
   kind: RuntimeKind;
   label: string;
@@ -154,6 +188,7 @@ interface AppConfig {
   port: number;
   upstreamBaseUrl: string;
   upstreamApiKey: string;
+  upstreamBackends: UpstreamBackend[];
   proxyApiKey: string;
   defaultModel: string;
   upstreamOutputFormat: "png" | "jpeg" | "webp";
@@ -183,6 +218,11 @@ interface AppConfig {
   prettyLogs: boolean;
   logSseData: boolean;
   imagePartialFallback: boolean;
+  blankImagePaddingEnabled: boolean;
+  blankImagePaddingDataUrl: string;
+  blankImagePaddingAction: ImageToolAction;
+  includeToolChoice: boolean;
+  includeSystemWithImageInput: boolean;
 }
 
 let ACTIVE_ENV_BINDINGS: RuntimeEnvBindings | undefined;
@@ -299,16 +339,150 @@ function detectRuntime(bindings = ACTIVE_ENV_BINDINGS): RuntimeInfo {
 }
 
 
+function envList(value: string): string[] {
+  return String(value || "")
+    .split(/[\n,;]+/g)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function backendField(record: Record<string, unknown>, ...names: string[]): string {
+  for (const name of names) {
+    const value = record[name];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" || typeof value === "boolean") return String(value).trim();
+  }
+  return "";
+}
+
+function pushUniqueBackend(list: UpstreamBackend[], backend: UpstreamBackend): void {
+  if (!backend.baseUrl) return;
+  const duplicate = list.some((item) => item.baseUrl === backend.baseUrl && item.apiKey === backend.apiKey);
+  if (!duplicate) list.push(backend);
+}
+
+function parseBackendSpec(spec: string, fallbackApiKey: string, index: number): UpstreamBackend | undefined {
+  const parts = spec.split("|").map((part) => part.trim());
+  let name = `upstream-${index + 1}`;
+  let baseUrl = "";
+  let apiKey = fallbackApiKey;
+
+  if (parts.length >= 3) {
+    name = parts[0] || name;
+    baseUrl = normalizeBaseUrl(parts[1] || "");
+    apiKey = parts.slice(2).join("|").trim() || fallbackApiKey;
+  } else if (parts.length === 2) {
+    if (/^https?:\/\//i.test(parts[0])) {
+      baseUrl = normalizeBaseUrl(parts[0]);
+      apiKey = parts[1] || fallbackApiKey;
+    } else {
+      name = parts[0] || name;
+      baseUrl = normalizeBaseUrl(parts[1]);
+    }
+  } else {
+    baseUrl = normalizeBaseUrl(parts[0] || "");
+  }
+
+  if (!baseUrl) return undefined;
+  return { name, baseUrl, apiKey };
+}
+
+function parseUpstreamBackends(legacyBaseUrl: string, legacyApiKey: string): UpstreamBackend[] {
+  const backends: UpstreamBackend[] = [];
+  const rawJson = env("UPSTREAM_BACKENDS", env("IMAGE_UPSTREAM_BACKENDS", "")).trim();
+
+  if (rawJson) {
+    if (rawJson.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(rawJson);
+        if (Array.isArray(parsed)) {
+          parsed.forEach((entry, index) => {
+            if (entry == null) return;
+            if (typeof entry === "string") {
+              const backend = parseBackendSpec(entry, legacyApiKey, index);
+              if (backend) pushUniqueBackend(backends, backend);
+              return;
+            }
+            if (typeof entry === "object" && !Array.isArray(entry)) {
+              const record = entry as Record<string, unknown>;
+              const name = backendField(record, "name", "id", "label") || `upstream-${index + 1}`;
+              const baseUrl = normalizeBaseUrl(backendField(record, "base_url", "baseUrl", "url", "endpoint"));
+              const apiKey = backendField(record, "api_key", "apiKey", "key", "token") || legacyApiKey;
+              if (baseUrl) pushUniqueBackend(backends, { name, baseUrl, apiKey });
+            }
+          });
+        }
+      } catch (err) {
+        log("warn", "UPSTREAM_BACKENDS is not valid JSON and will be parsed as a delimited list", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    if (backends.length === 0) {
+      rawJson.split(/[\n;]+/g).map((item) => item.trim()).filter(Boolean).forEach((spec, index) => {
+        const backend = parseBackendSpec(spec, legacyApiKey, index);
+        if (backend) pushUniqueBackend(backends, backend);
+      });
+    }
+  }
+
+  const baseUrls = envList(env("UPSTREAM_BASE_URLS", env("IMAGE_UPSTREAM_BASE_URLS", "")));
+  const apiKeys = envList(env("UPSTREAM_API_KEYS", env("IMAGE_UPSTREAM_API_KEYS", "")));
+  const names = envList(env("UPSTREAM_NAMES", env("IMAGE_UPSTREAM_NAMES", "")));
+
+  baseUrls.forEach((base, index) => {
+    const baseUrl = normalizeBaseUrl(base);
+    if (!baseUrl) return;
+    pushUniqueBackend(backends, {
+      name: names[index] || `upstream-${index + 1}`,
+      baseUrl,
+      apiKey: apiKeys[index] || apiKeys[0] || legacyApiKey,
+    });
+  });
+
+  if (legacyBaseUrl) {
+    pushUniqueBackend(backends, {
+      name: env("UPSTREAM_NAME", "primary").trim() || "primary",
+      baseUrl: legacyBaseUrl,
+      apiKey: legacyApiKey,
+    });
+  }
+
+  return backends;
+}
+
+function hashString(input: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function pickBackendForAttempt(backends: UpstreamBackend[], requestId: string, attempt: number): UpstreamBackend {
+  if (backends.length === 0) {
+    throw new HttpError(500, "No upstream backend is configured", "configuration_error", "missing_upstream_backend");
+  }
+  const offset = hashString(requestId) % backends.length;
+  return backends[(offset + attempt - 1) % backends.length];
+}
+
 function buildConfig(): AppConfig {
   const runtime = detectRuntime();
+  const upstreamBaseUrl = normalizeBaseUrl(env("UPSTREAM_BASE_URL", ""));
+  const upstreamApiKey = env("UPSTREAM_API_KEY", "");
+  const upstreamBackends = parseUpstreamBackends(upstreamBaseUrl, upstreamApiKey);
 
   return {
     runtime,
     host: env("HOST", "0.0.0.0"),
     port: intEnv("PORT", 8000),
 
-    upstreamBaseUrl: normalizeBaseUrl(env("UPSTREAM_BASE_URL", "")),
-    upstreamApiKey: env("UPSTREAM_API_KEY", ""),
+    upstreamBaseUrl,
+    upstreamApiKey,
+    upstreamBackends,
     proxyApiKey: env("PROXY_API_KEY", ""),
     defaultModel: env("DEFAULT_MODEL", "gpt-5.3-codex"),
     upstreamOutputFormat: normalizeImageFormat(env("UPSTREAM_IMAGE_OUTPUT_FORMAT", "png")),
@@ -348,6 +522,18 @@ function buildConfig(): AppConfig {
     // instead of compact JSON lines. Enable with LOG_PRETTY=true.
     prettyLogs: boolEnv("LOG_PRETTY", false),
     imagePartialFallback: boolEnv("IMAGE_PARTIAL_FALLBACK", false),
+
+    // Compatibility mode: some channels are more reliable when text-to-image
+    // is sent as an edit against a blank canvas rather than a pure text request.
+    blankImagePaddingEnabled: boolEnv("IMAGE_BLANK_PADDING_ENABLED", boolEnv("IMAGE_PAD_BLANK_IMAGE", true)),
+    blankImagePaddingDataUrl: env("IMAGE_BLANK_PADDING_DATA_URL", DEFAULT_BLANK_IMAGE_DATA_URL).trim() || DEFAULT_BLANK_IMAGE_DATA_URL,
+    blankImagePaddingAction: normalizeImageToolActionEnv(env("IMAGE_BLANK_PADDING_ACTION", "edit"), "edit"),
+
+    // v1response_image_gen.html works without tool_choice and sends image edits
+    // as a single user message with input_image + input_text. These defaults
+    // follow that shape while still allowing stricter OpenAI-compatible mode.
+    includeToolChoice: boolEnv("IMAGE_INCLUDE_TOOL_CHOICE", false),
+    includeSystemWithImageInput: boolEnv("IMAGE_INCLUDE_SYSTEM_WITH_IMAGE_INPUT", false),
   };
 }
 
@@ -422,7 +608,7 @@ function corsHeaders(): HeadersInit {
   return {
     "access-control-allow-origin": CONFIG.corsAllowOrigin,
     "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "authorization,content-type,x-image-race-concurrency,x-image-upstream-concurrency,x-image-style,x-image-style-plugin,x-image-style-plugin-file,x-request-id",
+    "access-control-allow-headers": "authorization,content-type,x-image-race-concurrency,x-image-upstream-concurrency,x-image-style,x-image-style-plugin,x-image-style-plugin-file,x-image-blank-padding,x-image-model,x-image-action,x-image-background,x-image-moderation,x-image-input-fidelity,x-image-output-compression,x-image-partial-images,x-request-id",
     "access-control-expose-headers": "x-request-id",
   };
 }
@@ -519,9 +705,47 @@ function resolveUpstreamApiKey(req: Request): string {
   return key;
 }
 
+function resolveUpstreamBackends(req: Request): UpstreamBackend[] {
+  requireProxyAuth(req);
+  assertUpstreamConfigured();
+
+  const clientBearer = getBearerToken(req);
+  const fallbackApiKey = CONFIG.upstreamApiKey || clientBearer;
+  const configured = CONFIG.upstreamBackends.length > 0
+    ? CONFIG.upstreamBackends
+    : CONFIG.upstreamBaseUrl
+      ? [{ name: "primary", baseUrl: CONFIG.upstreamBaseUrl, apiKey: CONFIG.upstreamApiKey }]
+      : [];
+
+  const resolved = configured.map((backend, index) => ({
+    name: backend.name || `upstream-${index + 1}`,
+    baseUrl: backend.baseUrl,
+    apiKey: backend.apiKey || fallbackApiKey,
+  })).filter((backend) => backend.baseUrl);
+
+  const missingKey = resolved.find((backend) => !backend.apiKey);
+  if (missingKey) {
+    throw new HttpError(401, `Missing upstream API key for backend "${missingKey.name}". Set UPSTREAM_API_KEY, per-backend api_key, or pass Authorization: Bearer <upstream-key>.`, "authentication_error", "missing_api_key", {
+      backend: missingKey.name,
+      base_url: missingKey.baseUrl,
+    });
+  }
+
+  if (resolved.length === 0) {
+    throw new HttpError(500, "No usable upstream backend is configured", "configuration_error", "missing_upstream_backend");
+  }
+
+  return resolved;
+}
+
+function resolvePrimaryUpstreamBackend(req: Request): UpstreamBackend {
+  const backends = resolveUpstreamBackends(req);
+  return backends[0];
+}
+
 function assertUpstreamConfigured(): void {
-  if (!CONFIG.upstreamBaseUrl) {
-    throw new HttpError(500, "UPSTREAM_BASE_URL is not configured", "configuration_error", "missing_upstream_base_url");
+  if (CONFIG.upstreamBackends.length === 0 && !CONFIG.upstreamBaseUrl) {
+    throw new HttpError(500, "No upstream backend is configured. Set UPSTREAM_BASE_URL or UPSTREAM_BACKENDS.", "configuration_error", "missing_upstream_base_url");
   }
 }
 
@@ -541,6 +765,17 @@ function intFromUnknown(value: unknown, fallback: number): number {
   if (value == null || value === "") return fallback;
   const n = Number.parseInt(String(value), 10);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function boolFromUnknown(value: unknown, fallback: boolean): boolean {
+  if (value == null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const s = String(value).trim().toLowerCase();
+  if (!s) return fallback;
+  if (/^(1|true|yes|on|enable|enabled)$/i.test(s)) return true;
+  if (/^(0|false|no|off|disable|disabled)$/i.test(s)) return false;
+  return fallback;
 }
 
 function stringFromUnknown(value: unknown, fallback = ""): string {
@@ -999,6 +1234,9 @@ async function parseImageRequest(req: Request, mode: "generation" | "edit" | "va
       input_fidelity: await scalarFromForm(form, "input_fidelity"),
       output_compression: await scalarFromForm(form, "output_compression"),
       partial_images: await scalarFromForm(form, "partial_images"),
+      blank_image_padding: await scalarFromForm(form, "blank_image_padding"),
+      pad_blank_image: await scalarFromForm(form, "pad_blank_image"),
+      use_blank_image: await scalarFromForm(form, "use_blank_image"),
       style: await scalarFromForm(form, "style"),
       style_plugin: await scalarFromForm(form, "style_plugin"),
       style_name: await scalarFromForm(form, "style_name"),
@@ -1123,6 +1361,10 @@ async function parseImageRequest(req: Request, mode: "generation" | "edit" | "va
     0,
     3,
   ) ?? 0;
+  const blankImagePadding = mode === "generation" && imageDataUrls.length === 0 && boolFromUnknown(
+    raw.blank_image_padding ?? raw.pad_blank_image ?? raw.use_blank_image ?? req.headers.get("x-image-blank-padding"),
+    CONFIG.blankImagePaddingEnabled,
+  );
   const inputImageMask = await normalizeInputImageMask(inputImageMaskCandidate, requestId);
   const stylePlugin = await resolveStylePlugin(raw, req);
 
@@ -1145,6 +1387,7 @@ async function parseImageRequest(req: Request, mode: "generation" | "edit" | "va
     inputImageMask,
     outputCompression,
     partialImages,
+    blankImagePadding,
     size,
     quality,
     stylePlugin,
@@ -1166,6 +1409,7 @@ async function parseImageRequest(req: Request, mode: "generation" | "edit" | "va
       input_image_mask: redactedInputImageMask(inputImageMask),
       output_compression: outputCompression,
       partial_images: partialImages,
+      blank_image_padding: blankImagePadding,
       size,
       quality,
       style_plugin: stylePluginLogInfo(stylePlugin),
@@ -1200,6 +1444,7 @@ function buildStylePluginPromptLines(plugin?: StylePlugin): string[] {
 
 function buildUpstreamImagePrompt(parsed: ParsedImageRequest): string {
   const hasReferenceImages = parsed.imageDataUrls.length > 0;
+  const hasBlankPaddingImage = parsed.blankImagePadding && !hasReferenceImages;
   const modeName = parsed.mode === "variation"
     ? "图片变体"
     : parsed.mode === "edit"
@@ -1219,6 +1464,10 @@ function buildUpstreamImagePrompt(parsed: ParsedImageRequest): string {
   ];
 
   const referenceLines: string[] = [];
+  if (hasBlankPaddingImage) {
+    referenceLines.push("请求中会附带一张纯白空白图作为兼容性垫图；请把它当作空画布，不保留白底、不提及空白图，并根据用户原始需求从零生成完整图片。");
+  }
+
   if (hasReferenceImages) {
     if (parsed.mode === "variation") {
       referenceLines.push("保留参考图片的主体、构图和整体视觉关系；在风格、细节、背景、色彩、光影或氛围上做自然变化。");
@@ -1235,7 +1484,7 @@ function buildUpstreamImagePrompt(parsed: ParsedImageRequest): string {
   // more cache-friendly for upstream prompt-prefix caching.
   return [
     ...taskLines,
-    ...(referenceLines.length > 0 ? ["", "参考图片处理：", ...referenceLines.map((line) => `- ${line}`)] : []),
+    ...(referenceLines.length > 0 ? ["", hasBlankPaddingImage ? "输入图片兼容处理：" : "参考图片处理：", ...referenceLines.map((line) => `- ${line}`)] : []),
     ...buildStylePluginPromptLines(parsed.stylePlugin),
     "",
     "用户原始需求如下：",
@@ -1253,6 +1502,7 @@ function buildResponsesPayload(parsed: ParsedImageRequest): Record<string, unkno
 
   if (parsed.imageModel) tool.model = parsed.imageModel;
   if (parsed.imageAction) tool.action = parsed.imageAction;
+  else if (parsed.blankImagePadding) tool.action = CONFIG.blankImagePaddingAction;
   if (parsed.background) tool.background = parsed.background;
   if (parsed.size) tool.size = parsed.size;
   if (parsed.quality) tool.quality = parsed.quality;
@@ -1261,9 +1511,14 @@ function buildResponsesPayload(parsed: ParsedImageRequest): Record<string, unkno
   if (parsed.outputCompression != null) tool.output_compression = parsed.outputCompression;
 
   const taskText = buildUpstreamImagePrompt(parsed);
+  const inputImageDataUrls = parsed.imageDataUrls.length > 0
+    ? parsed.imageDataUrls
+    : parsed.blankImagePadding
+      ? [CONFIG.blankImagePaddingDataUrl]
+      : [];
 
-  if (parsed.imageDataUrls.length > 0) {
-    const content: Array<Record<string, string>> = parsed.imageDataUrls.map((dataUrl) => ({
+  if (inputImageDataUrls.length > 0) {
+    const content: Array<Record<string, string>> = inputImageDataUrls.map((dataUrl) => ({
       type: "input_image",
       image_url: dataUrl,
     }));
@@ -1273,19 +1528,24 @@ function buildResponsesPayload(parsed: ParsedImageRequest): Record<string, unkno
       text: taskText,
     });
 
-    return {
-      model: parsed.model,
-      input: [
+    const input = CONFIG.includeSystemWithImageInput
+      ? [
         { role: "system", content: UPSTREAM_IMAGE_SYSTEM_PROMPT },
         { role: "user", content },
-      ],
+      ]
+      : [{ role: "user", content }];
+
+    const payload: Record<string, unknown> = {
+      model: parsed.model,
+      input,
       tools: [tool],
-      tool_choice: { type: "image_generation" },
       stream: true,
     };
+    if (CONFIG.includeToolChoice) payload.tool_choice = { type: "image_generation" };
+    return payload;
   }
 
-  return {
+  const payload: Record<string, unknown> = {
     model: parsed.model,
     input: [
       {
@@ -1298,9 +1558,10 @@ function buildResponsesPayload(parsed: ParsedImageRequest): Record<string, unkno
       },
     ],
     tools: [tool],
-    tool_choice: { type: "image_generation" },
     stream: true,
   };
+  if (CONFIG.includeToolChoice) payload.tool_choice = { type: "image_generation" };
+  return payload;
 }
 
 function isLikelyBase64ImageString(s: string): boolean {
@@ -1571,7 +1832,7 @@ function briefError(err: unknown): string {
 
 async function callUpstreamOnce(params: {
   payload: Record<string, unknown>;
-  upstreamApiKey: string;
+  backend: UpstreamBackend;
   requestId: string;
   raceGroup: number;
   attempt: number;
@@ -1589,9 +1850,9 @@ async function callUpstreamOnce(params: {
   let lastPartialImage: ExtractedImage | null = null;
   let partialImageCount = 0;
 
-  const url = CONFIG.upstreamBaseUrl + "/v1/responses";
+  const url = params.backend.baseUrl + "/v1/responses";
   const headers = {
-    "authorization": "Bearer " + params.upstreamApiKey,
+    "authorization": "Bearer " + params.backend.apiKey,
     "accept": "text/event-stream",
     "content-type": "application/json",
     "chatgpt-account-id": "",
@@ -1605,6 +1866,7 @@ async function callUpstreamOnce(params: {
     race_group: params.raceGroup,
     attempt: params.attempt,
     url,
+    backend: params.backend.name,
     timeout_ms: CONFIG.upstreamTimeoutMs,
   });
 
@@ -1621,6 +1883,7 @@ async function callUpstreamOnce(params: {
       bytes: extracted.bytes.byteLength,
       json_path: extracted.path,
       partial_images_seen: partialImageCount,
+      backend: params.backend.name,
     });
 
     return {
@@ -1632,6 +1895,8 @@ async function callUpstreamOnce(params: {
       upstreamElapsedMs: elapsed,
       winningAttempt: params.attempt,
       raceGroup: params.raceGroup,
+      upstreamName: params.backend.name,
+      upstreamBaseUrl: params.backend.baseUrl,
     };
   };
 
@@ -1753,7 +2018,7 @@ async function callUpstreamOnce(params: {
 
 async function raceUpstreamImage(params: {
   payload: Record<string, unknown>;
-  upstreamApiKey: string;
+  upstreamBackends: UpstreamBackend[];
   requestId: string;
   raceGroup: number;
   raceConcurrency: number;
@@ -1771,7 +2036,7 @@ async function raceUpstreamImage(params: {
 
       callUpstreamOnce({
         payload: params.payload,
-        upstreamApiKey: params.upstreamApiKey,
+        backend: pickBackendForAttempt(params.upstreamBackends, params.requestId, attempt),
         requestId: params.requestId,
         raceGroup: params.raceGroup,
         attempt,
@@ -1822,7 +2087,7 @@ async function raceUpstreamImage(params: {
 
 async function collectLenientUpstreamImages(params: {
   payload: Record<string, unknown>;
-  upstreamApiKey: string;
+  upstreamBackends: UpstreamBackend[];
   requestId: string;
   targetCount: number;
   totalAttempts: number;
@@ -1892,7 +2157,7 @@ async function collectLenientUpstreamImages(params: {
           try {
             const image = await callUpstreamOnce({
               payload: params.payload,
-              upstreamApiKey: params.upstreamApiKey,
+              backend: pickBackendForAttempt(params.upstreamBackends, params.requestId, candidateAttempt),
               requestId: params.requestId,
               raceGroup: candidateAttempt,
               attempt: 1,
@@ -1963,13 +2228,14 @@ async function collectLenientUpstreamImages(params: {
 }
 
 async function handleImageEndpoint(req: Request, mode: "generation" | "edit" | "variation", requestId: string): Promise<Response> {
-  const upstreamApiKey = resolveUpstreamApiKey(req);
+  const upstreamBackends = resolveUpstreamBackends(req);
   const parsed = await parseImageRequest(req, mode, requestId);
 
   log("info", "image request parsed", {
     request_id: requestId,
     method: req.method,
     path: new URL(req.url).pathname,
+    upstream_backends: upstreamBackends.map((backend) => backend.name),
     ...parsed.rawBodyForLog,
   });
 
@@ -1977,7 +2243,7 @@ async function handleImageEndpoint(req: Request, mode: "generation" | "edit" | "
 
   const batch = await collectLenientUpstreamImages({
     payload,
-    upstreamApiKey,
+    upstreamBackends,
     requestId,
     targetCount: parsed.n,
     totalAttempts: parsed.candidateCount,
@@ -2001,6 +2267,7 @@ async function handleImageEndpoint(req: Request, mode: "generation" | "edit" | "
 
     item.mime_type = image.mime;
     item.size_bytes = image.bytes.byteLength;
+    item.upstream_backend = image.upstreamName;
     item.revised_prompt = parsed.prompt;
 
     data.push(item);
@@ -2016,6 +2283,7 @@ async function handleImageEndpoint(req: Request, mode: "generation" | "edit" | "
     response_format: parsed.responseFormat,
     candidate_count: parsed.candidateCount,
     upstream_concurrency: parsed.upstreamConcurrency,
+    upstream_backends: upstreamBackends.map((backend) => backend.name),
     stopped_reason: batch.stoppedReason,
     attempts_started: batch.attemptsStarted,
     attempts_completed: batch.attemptsCompleted,
@@ -2038,19 +2306,59 @@ async function handleImageEndpoint(req: Request, mode: "generation" | "edit" | "
       failed: batch.failures.length,
       active_aborted: batch.activeAborted,
       upstream_concurrency: parsed.upstreamConcurrency,
+      upstream_backends: upstreamBackends.map((backend) => backend.name),
       stopped_reason: batch.stoppedReason,
       failure_reasons: batch.failures.slice(0, 20),
     },
   }, 200, { "x-request-id": requestId });
 }
 
-async function handleModels(req: Request, requestId: string): Promise<Response> {
-  const upstreamApiKey = resolveUpstreamApiKey(req);
-  assertUpstreamConfigured();
+async function handleResponsesProxy(req: Request, requestId: string): Promise<Response> {
+  checkContentLength(req);
+  const backend = resolvePrimaryUpstreamBackend(req);
+  const body = await req.text();
 
-  const resp = await fetch(CONFIG.upstreamBaseUrl + "/v1/models", {
+  const headers: Record<string, string> = {
+    "authorization": "Bearer " + backend.apiKey,
+    "accept": req.headers.get("accept") || "text/event-stream",
+    "content-type": req.headers.get("content-type") || "application/json",
+    "chatgpt-account-id": req.headers.get("chatgpt-account-id") || "",
+    "version": req.headers.get("version") || "0.122.0",
+    "originator": req.headers.get("originator") || "deno_v1_images_proxy",
+    "session_id": req.headers.get("session_id") || `${requestId}-responses-proxy`,
+  };
+
+  const resp = await fetch(backend.baseUrl + "/v1/responses", {
+    method: "POST",
+    headers,
+    body,
+  });
+
+  log("info", "responses proxied", {
+    request_id: requestId,
+    upstream_status: resp.status,
+    upstream_backend: backend.name,
+    content_type: resp.headers.get("content-type") || "",
+  });
+
+  return new Response(resp.body, {
+    status: resp.status,
     headers: {
-      "authorization": "Bearer " + upstreamApiKey,
+      ...corsHeaders(),
+      "content-type": resp.headers.get("content-type") || "text/event-stream; charset=utf-8",
+      "cache-control": resp.headers.get("cache-control") || "no-cache",
+      "x-request-id": requestId,
+      "x-upstream-backend": backend.name,
+    },
+  });
+}
+
+async function handleModels(req: Request, requestId: string): Promise<Response> {
+  const backend = resolvePrimaryUpstreamBackend(req);
+
+  const resp = await fetch(backend.baseUrl + "/v1/models", {
+    headers: {
+      "authorization": "Bearer " + backend.apiKey,
       "content-type": "application/json",
     },
   });
@@ -2059,6 +2367,7 @@ async function handleModels(req: Request, requestId: string): Promise<Response> 
   log("info", "models proxied", {
     request_id: requestId,
     upstream_status: resp.status,
+    upstream_backend: backend.name,
     bytes: body.length,
   });
 
@@ -2082,7 +2391,21 @@ async function handleHealth(): Promise<Response> {
       is_edge: CONFIG.runtime.isEdge,
       has_deno_serve: CONFIG.runtime.hasDenoServe,
     },
-    upstream_configured: Boolean(CONFIG.upstreamBaseUrl),
+    upstream_configured: CONFIG.upstreamBackends.length > 0 || Boolean(CONFIG.upstreamBaseUrl),
+    upstream_backends: CONFIG.upstreamBackends.map((backend) => ({
+      name: backend.name,
+      base_url: backend.baseUrl,
+      has_api_key: Boolean(backend.apiKey || CONFIG.upstreamApiKey),
+    })),
+    blank_image_padding: {
+      enabled: CONFIG.blankImagePaddingEnabled,
+      action: CONFIG.blankImagePaddingAction,
+      has_custom_data_url: CONFIG.blankImagePaddingDataUrl !== DEFAULT_BLANK_IMAGE_DATA_URL,
+    },
+    responses_compat: {
+      include_tool_choice: CONFIG.includeToolChoice,
+      include_system_with_image_input: CONFIG.includeSystemWithImageInput,
+    },
     style_plugin: {
       default: CONFIG.defaultStylePlugin || "off",
       dir: CONFIG.stylePluginDir,
@@ -2126,6 +2449,10 @@ async function route(req: Request): Promise<Response> {
       return await handleModels(req, requestId);
     }
 
+    if (req.method === "POST" && path === "/v1/responses") {
+      return await handleResponsesProxy(req, requestId);
+    }
+
     if (req.method === "POST" && path === "/v1/images/generations") {
       return await handleImageEndpoint(req, "generation", requestId);
     }
@@ -2159,12 +2486,16 @@ function logRuntimeBoot(kind: "server" | "worker"): void {
     hostname: CONFIG.host,
     port: CONFIG.port,
     upstream_base_url: CONFIG.upstreamBaseUrl || "(not configured)",
+    upstream_backends: CONFIG.upstreamBackends.map((backend) => backend.name),
     default_model: CONFIG.defaultModel,
     default_race_concurrency: CONFIG.defaultRaceConcurrency,
     max_race_concurrency: CONFIG.maxRaceConcurrency,
     max_upstream_concurrency: CONFIG.maxUpstreamConcurrency,
     max_total_upstream_calls: CONFIG.maxTotalUpstreamCalls,
     image_partial_fallback: CONFIG.imagePartialFallback,
+    blank_image_padding: CONFIG.blankImagePaddingEnabled,
+    blank_image_padding_action: CONFIG.blankImagePaddingAction,
+    include_tool_choice: CONFIG.includeToolChoice,
     style_plugin: CONFIG.defaultStylePlugin || "off",
     style_plugin_dir: CONFIG.stylePluginDir,
     style_plugin_ext: CONFIG.stylePluginExt,
