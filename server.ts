@@ -10,6 +10,15 @@
 //   PROXY_API_KEY="local-secret" \
 //   deno run --allow-net --allow-env v1_images_server_no_file_storage.ts
 //
+// Optional style plugin:
+//   IMAGE_STYLE_PLUGIN="realistic"            # reads ./styles/realistic.txt
+//   IMAGE_STYLE_PLUGIN_DIR="./styles"
+//   IMAGE_STYLE_PLUGIN_FILE="/etc/style.txt"  # reads explicit external text file
+//   IMAGE_STYLE_PLUGIN_TEXT="..."             # inline style text, works on edge runtimes
+//
+// Add --allow-read when reading style files locally:
+//   deno run --allow-net --allow-env --allow-read=./styles v1_images_server_no_file_storage.ts
+//
 
 type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -39,6 +48,28 @@ interface ImageToolInputMask {
   image_url?: string;
 }
 
+type StylePluginSource =
+  | "env_text"
+  | "env_file"
+  | "preset_file"
+  | "request_text"
+  | "request_file"
+  | "disabled";
+
+interface StylePlugin {
+  name: string;
+  source: StylePluginSource;
+  content: string;
+}
+
+interface StylePluginLogInfo {
+  enabled: boolean;
+  name?: string;
+  source?: StylePluginSource;
+  chars?: number;
+  bytes?: number;
+}
+
 interface ParsedImageRequest {
   model: string;
   prompt: string;
@@ -60,6 +91,7 @@ interface ParsedImageRequest {
   partialImages: number;
   size?: string;
   quality?: string;
+  stylePlugin?: StylePlugin;
   rawBodyForLog: Record<string, unknown>;
 }
 
@@ -136,6 +168,15 @@ interface AppConfig {
   maxInputImageBytes: number;
   maxInputImages: number;
   allowRemoteImageUrls: boolean;
+  defaultStylePlugin: string;
+  stylePluginDir: string;
+  stylePluginExt: string;
+  stylePluginFile: string;
+  stylePluginText: string;
+  stylePluginStrict: boolean;
+  allowRequestStylePlugin: boolean;
+  allowRequestStylePluginFile: boolean;
+  maxStylePluginBytes: number;
   corsAllowOrigin: string;
   logLevel: LogLevel;
   // If true, use human-friendly, colored terminal output instead of JSON.
@@ -285,6 +326,21 @@ function buildConfig(): AppConfig {
     maxInputImages: intEnv("MAX_INPUT_IMAGES", 8),
     allowRemoteImageUrls: boolEnv("ALLOW_REMOTE_IMAGE_URLS", false),
 
+    // Style plugin support:
+    // - IMAGE_STYLE_PLUGIN=realistic reads ./styles/realistic.txt by default.
+    // - IMAGE_STYLE_PLUGIN_FILE=/path/to/style.txt reads an explicit external text file.
+    // - IMAGE_STYLE_PLUGIN_TEXT="..." injects style text directly from env/bindings.
+    // - Requests may override with style/style_plugin/style_text unless disabled.
+    defaultStylePlugin: env("IMAGE_STYLE_PLUGIN", env("DEFAULT_IMAGE_STYLE_PLUGIN", "off")).trim(),
+    stylePluginDir: env("IMAGE_STYLE_PLUGIN_DIR", "./styles").trim() || "./styles",
+    stylePluginExt: env("IMAGE_STYLE_PLUGIN_EXT", "txt").trim() || "txt",
+    stylePluginFile: env("IMAGE_STYLE_PLUGIN_FILE", "").trim(),
+    stylePluginText: env("IMAGE_STYLE_PLUGIN_TEXT", "").trim(),
+    stylePluginStrict: boolEnv("IMAGE_STYLE_PLUGIN_STRICT", false),
+    allowRequestStylePlugin: boolEnv("ALLOW_REQUEST_STYLE_PLUGIN", true),
+    allowRequestStylePluginFile: boolEnv("ALLOW_REQUEST_STYLE_PLUGIN_FILE", false),
+    maxStylePluginBytes: intEnv("MAX_STYLE_PLUGIN_BYTES", 64 * 1024),
+
     corsAllowOrigin: env("CORS_ALLOW_ORIGIN", "*"),
     logLevel: (env("LOG_LEVEL", "info").toLowerCase() as LogLevel),
     logSseData: boolEnv("LOG_SSE_DATA", false),
@@ -366,7 +422,7 @@ function corsHeaders(): HeadersInit {
   return {
     "access-control-allow-origin": CONFIG.corsAllowOrigin,
     "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "authorization,content-type,x-image-race-concurrency,x-image-upstream-concurrency,x-request-id",
+    "access-control-allow-headers": "authorization,content-type,x-image-race-concurrency,x-image-upstream-concurrency,x-image-style,x-image-style-plugin,x-image-style-plugin-file,x-request-id",
     "access-control-expose-headers": "x-request-id",
   };
 }
@@ -517,6 +573,168 @@ function intParamFromUnknown(value: unknown, name: string, min: number, max: num
     });
   }
   return clampInt(n, min, max);
+}
+
+function stylePluginLogInfo(plugin?: StylePlugin): StylePluginLogInfo {
+  if (!plugin) return { enabled: false };
+  const bytes = new TextEncoder().encode(plugin.content).byteLength;
+  return {
+    enabled: true,
+    name: plugin.name,
+    source: plugin.source,
+    chars: plugin.content.length,
+    bytes,
+  };
+}
+
+function isDisabledStylePluginName(name: string): boolean {
+  return /^(off|none|no|false|0|disabled|disable)$/i.test(name.trim());
+}
+
+function safeStylePluginName(value: string, parameterName: string): string {
+  const name = value.trim();
+  if (!name) return "";
+  if (isDisabledStylePluginName(name)) return "off";
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(name)) {
+    throw new HttpError(400, `${parameterName} must be a safe preset name containing only letters, numbers, "_" or "-"`, "invalid_request_error", "invalid_style_plugin", {
+      parameter: parameterName,
+      value,
+    });
+  }
+  return name;
+}
+
+function safeStylePluginExt(value: string): string {
+  const ext = value.trim().replace(/^\.+/, "");
+  if (!ext) return "txt";
+  if (!/^[A-Za-z0-9]{1,16}$/.test(ext)) return "txt";
+  return ext;
+}
+
+function joinStylePluginPath(dir: string, name: string, ext: string): string {
+  const cleanDir = (dir.trim() || ".").replace(/[\\/]+$/, "");
+  return `${cleanDir}/${name}.${safeStylePluginExt(ext)}`;
+}
+
+async function readStylePluginFile(filePath: string, source: StylePluginSource, name: string): Promise<StylePlugin | undefined> {
+  const deno = (globalThis as any).Deno;
+  if (!filePath) return undefined;
+  if (!deno?.readFile) {
+    const message = "Style plugin file loading requires a Deno runtime with read permission; use IMAGE_STYLE_PLUGIN_TEXT on edge runtimes.";
+    if (CONFIG.stylePluginStrict) {
+      throw new HttpError(500, message, "configuration_error", "style_plugin_file_unavailable", {
+        file: filePath,
+      });
+    }
+    log("warn", "style plugin file skipped because file API is unavailable", {
+      source,
+      name,
+      file: filePath,
+    });
+    return undefined;
+  }
+
+  try {
+    const bytes = new Uint8Array(await deno.readFile(filePath));
+    if (bytes.byteLength > CONFIG.maxStylePluginBytes) {
+      throw new HttpError(413, "Style plugin file is too large", "invalid_request_error", "style_plugin_too_large", {
+        file: filePath,
+        bytes: bytes.byteLength,
+        max_style_plugin_bytes: CONFIG.maxStylePluginBytes,
+      });
+    }
+
+    const content = new TextDecoder().decode(bytes).trim();
+    if (!content) {
+      if (CONFIG.stylePluginStrict) {
+        throw new HttpError(500, "Style plugin file is empty", "configuration_error", "empty_style_plugin_file", {
+          file: filePath,
+        });
+      }
+      log("warn", "empty style plugin file ignored", {
+        source,
+        name,
+        file: filePath,
+      });
+      return undefined;
+    }
+
+    return { name, source, content };
+  } catch (err) {
+    if (err instanceof HttpError) throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    if (CONFIG.stylePluginStrict) {
+      throw new HttpError(500, "Failed to read style plugin file", "configuration_error", "style_plugin_file_read_failed", {
+        file: filePath,
+        error: message,
+      });
+    }
+    log("warn", "style plugin file read failed and was ignored", {
+      source,
+      name,
+      file: filePath,
+      error: message,
+    });
+    return undefined;
+  }
+}
+
+function normalizeInlineStylePluginText(value: unknown): string {
+  const text = stringFromUnknown(value, "").trim();
+  if (!text) return "";
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.byteLength > CONFIG.maxStylePluginBytes) {
+    throw new HttpError(413, "Inline style plugin text is too large", "invalid_request_error", "style_plugin_too_large", {
+      bytes: bytes.byteLength,
+      max_style_plugin_bytes: CONFIG.maxStylePluginBytes,
+    });
+  }
+  return text;
+}
+
+async function resolveStylePlugin(raw: Record<string, unknown>, req: Request): Promise<StylePlugin | undefined> {
+  const headerStyle = req.headers.get("x-image-style") ?? req.headers.get("x-image-style-plugin") ?? "";
+  const headerStyleFile = req.headers.get("x-image-style-plugin-file") ?? "";
+
+  const requestStyleText = CONFIG.allowRequestStylePlugin
+    ? normalizeInlineStylePluginText(raw.style_text ?? raw.style_plugin_text ?? raw.stylePrompt ?? raw.style_prompt)
+    : "";
+  if (requestStyleText) {
+    return { name: "request", source: "request_text", content: requestStyleText };
+  }
+
+  const requestStyleNameRaw = CONFIG.allowRequestStylePlugin
+    ? stringFromUnknown(raw.style ?? raw.style_plugin ?? raw.style_name ?? raw.style_preset ?? headerStyle, "").trim()
+    : "";
+  if (requestStyleNameRaw) {
+    const requestStyleName = safeStylePluginName(requestStyleNameRaw, "style_plugin");
+    if (isDisabledStylePluginName(requestStyleName)) return undefined;
+    const file = joinStylePluginPath(CONFIG.stylePluginDir, requestStyleName, CONFIG.stylePluginExt);
+    return await readStylePluginFile(file, "preset_file", requestStyleName);
+  }
+
+  const requestStyleFile = CONFIG.allowRequestStylePlugin && CONFIG.allowRequestStylePluginFile
+    ? stringFromUnknown(raw.style_file ?? raw.style_plugin_file ?? headerStyleFile, "").trim()
+    : "";
+  if (requestStyleFile) {
+    return await readStylePluginFile(requestStyleFile, "request_file", "request_file");
+  }
+
+  const envStyleText = normalizeInlineStylePluginText(CONFIG.stylePluginText);
+  if (envStyleText) {
+    return { name: "env", source: "env_text", content: envStyleText };
+  }
+
+  if (CONFIG.stylePluginFile) {
+    const plugin = await readStylePluginFile(CONFIG.stylePluginFile, "env_file", "env_file");
+    if (plugin) return plugin;
+  }
+
+  const envStyleName = safeStylePluginName(CONFIG.defaultStylePlugin, "IMAGE_STYLE_PLUGIN");
+  if (!envStyleName || isDisabledStylePluginName(envStyleName)) return undefined;
+
+  const file = joinStylePluginPath(CONFIG.stylePluginDir, envStyleName, CONFIG.stylePluginExt);
+  return await readStylePluginFile(file, "preset_file", envStyleName);
 }
 
 function redactedInputImageMask(mask?: ImageToolInputMask): Record<string, boolean> | undefined {
@@ -781,6 +999,14 @@ async function parseImageRequest(req: Request, mode: "generation" | "edit" | "va
       input_fidelity: await scalarFromForm(form, "input_fidelity"),
       output_compression: await scalarFromForm(form, "output_compression"),
       partial_images: await scalarFromForm(form, "partial_images"),
+      style: await scalarFromForm(form, "style"),
+      style_plugin: await scalarFromForm(form, "style_plugin"),
+      style_name: await scalarFromForm(form, "style_name"),
+      style_preset: await scalarFromForm(form, "style_preset"),
+      style_text: await scalarFromForm(form, "style_text"),
+      style_plugin_text: await scalarFromForm(form, "style_plugin_text"),
+      style_file: await scalarFromForm(form, "style_file"),
+      style_plugin_file: await scalarFromForm(form, "style_plugin_file"),
     };
 
     inputImageMaskCandidate = form.get("input_image_mask") ?? form.get("image_mask") ?? form.get("mask") ?? undefined;
@@ -898,6 +1124,7 @@ async function parseImageRequest(req: Request, mode: "generation" | "edit" | "va
     3,
   ) ?? 0;
   const inputImageMask = await normalizeInputImageMask(inputImageMaskCandidate, requestId);
+  const stylePlugin = await resolveStylePlugin(raw, req);
 
   return {
     model,
@@ -920,6 +1147,7 @@ async function parseImageRequest(req: Request, mode: "generation" | "edit" | "va
     partialImages,
     size,
     quality,
+    stylePlugin,
     rawBodyForLog: {
       model,
       prompt_length: prompt.length,
@@ -940,6 +1168,7 @@ async function parseImageRequest(req: Request, mode: "generation" | "edit" | "va
       partial_images: partialImages,
       size,
       quality,
+      style_plugin: stylePluginLogInfo(stylePlugin),
     },
   };
 }
@@ -954,6 +1183,20 @@ const UPSTREAM_IMAGE_SYSTEM_PROMPT = [
   UPSTREAM_IMAGE_RETRY_INSTRUCTION,
   "最终只产出图片，不解释改写过程，不输出 Markdown 或无关文本。",
 ].join("\n");
+
+function buildStylePluginPromptLines(plugin?: StylePlugin): string[] {
+  if (!plugin) return [];
+  return [
+    "",
+    "风格插件：",
+    `- 名称：${plugin.name}`,
+    `- 来源：${plugin.source}`,
+    "- 用法：将以下文本作为默认视觉风格约束融入最终视觉提示词。",
+    "- 优先级：用户原始需求、编辑范围、参考图保持要求优先；如冲突，以用户原始需求为准。",
+    "",
+    plugin.content,
+  ];
+}
 
 function buildUpstreamImagePrompt(parsed: ParsedImageRequest): string {
   const hasReferenceImages = parsed.imageDataUrls.length > 0;
@@ -993,6 +1236,7 @@ function buildUpstreamImagePrompt(parsed: ParsedImageRequest): string {
   return [
     ...taskLines,
     ...(referenceLines.length > 0 ? ["", "参考图片处理：", ...referenceLines.map((line) => `- ${line}`)] : []),
+    ...buildStylePluginPromptLines(parsed.stylePlugin),
     "",
     "用户原始需求如下：",
     parsed.prompt,
@@ -1786,6 +2030,7 @@ async function handleImageEndpoint(req: Request, mode: "generation" | "edit" | "
     partial,
     requested: parsed.n,
     successful: data.length,
+    style_plugin: stylePluginLogInfo(parsed.stylePlugin),
     attempts: {
       planned: parsed.candidateCount,
       started: batch.attemptsStarted,
@@ -1838,6 +2083,17 @@ async function handleHealth(): Promise<Response> {
       has_deno_serve: CONFIG.runtime.hasDenoServe,
     },
     upstream_configured: Boolean(CONFIG.upstreamBaseUrl),
+    style_plugin: {
+      default: CONFIG.defaultStylePlugin || "off",
+      dir: CONFIG.stylePluginDir,
+      ext: CONFIG.stylePluginExt,
+      has_env_file: Boolean(CONFIG.stylePluginFile),
+      has_env_text: Boolean(CONFIG.stylePluginText),
+      strict: CONFIG.stylePluginStrict,
+      allow_request_override: CONFIG.allowRequestStylePlugin,
+      allow_request_file: CONFIG.allowRequestStylePluginFile,
+      max_bytes: CONFIG.maxStylePluginBytes,
+    },
   });
 }
 
@@ -1909,6 +2165,11 @@ function logRuntimeBoot(kind: "server" | "worker"): void {
     max_upstream_concurrency: CONFIG.maxUpstreamConcurrency,
     max_total_upstream_calls: CONFIG.maxTotalUpstreamCalls,
     image_partial_fallback: CONFIG.imagePartialFallback,
+    style_plugin: CONFIG.defaultStylePlugin || "off",
+    style_plugin_dir: CONFIG.stylePluginDir,
+    style_plugin_ext: CONFIG.stylePluginExt,
+    style_plugin_env_file: Boolean(CONFIG.stylePluginFile),
+    style_plugin_env_text: Boolean(CONFIG.stylePluginText),
   });
 }
 
