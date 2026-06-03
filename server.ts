@@ -406,6 +406,74 @@ function splitBackendSpecAndWeight(parts: string[]): { parts: string[]; weight: 
   return { parts, weight: DEFAULT_UPSTREAM_BACKEND_WEIGHT };
 }
 
+
+// CONFIG is assigned after buildConfig() runs, but parseUpstreamBackends() can
+// emit startup warnings while buildConfig() is still executing. Declare CONFIG
+// before any startup log path so log() can safely fall back to env defaults.
+let CONFIG: AppConfig;
+
+const LOG_ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
+
+function activeLogLevel(): LogLevel {
+  const level = (CONFIG?.logLevel ?? env("LOG_LEVEL", "info")).toLowerCase();
+  return (level in LOG_ORDER ? level : "info") as LogLevel;
+}
+
+function log(level: LogLevel, message: string, fields: Record<string, unknown> = {}): void {
+  const config = CONFIG;
+  if (LOG_ORDER[level] < LOG_ORDER[activeLogLevel()]) return;
+  const prettyLogs = config?.prettyLogs ?? boolEnv("LOG_PRETTY", false);
+
+  // Pretty terminal output when enabled in config
+  if (prettyLogs) {
+    const ts = new Date().toISOString();
+    const colorMap: Record<LogLevel, string> = {
+      debug: "\x1b[36m", // cyan
+      info: "\x1b[32m", // green
+      warn: "\x1b[33m", // yellow
+      error: "\x1b[31m", // red
+    };
+    const reset = "\x1b[0m";
+
+    const fmtValue = (v: unknown): string => {
+      if (v === null) return "null";
+      if (v === undefined) return "undefined";
+      if (typeof v === "string") return v;
+      if (typeof v === "number" || typeof v === "boolean") return String(v);
+      try {
+        return JSON.stringify(v);
+      } catch {
+        return String(v as any);
+      }
+    };
+
+    const fieldsStr = Object.keys(fields).length
+      ? " " + Object.entries(fields).map(([k, v]) => `${k}=${fmtValue(v)}`).join(" ")
+      : "";
+
+    const levelLabel = level.toUpperCase();
+    const coloredLevel = (colorMap[level] || "") + levelLabel + reset;
+    const line = `[${ts}] ${coloredLevel} ${message}${fieldsStr}`;
+
+    if (level === "error") console.error(line);
+    else if (level === "warn") console.warn(line);
+    else console.log(line);
+    return;
+  }
+
+  // Default: compact JSON log lines for structured logging
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    message,
+    ...fields,
+  };
+  const line = JSON.stringify(entry);
+  if (level === "error") console.error(line);
+  else if (level === "warn") console.warn(line);
+  else console.log(line);
+}
+
 function pushUniqueBackend(list: UpstreamBackend[], backend: UpstreamBackend): void {
   if (!backend.baseUrl) return;
   const normalized: UpstreamBackend = {
@@ -665,67 +733,12 @@ function buildConfig(): AppConfig {
   };
 }
 
-let CONFIG: AppConfig = buildConfig();
+CONFIG = buildConfig();
 
 function configureRuntime(bindings?: RuntimeEnvBindings): AppConfig {
   if (bindings) ACTIVE_ENV_BINDINGS = bindings;
   CONFIG = buildConfig();
   return CONFIG;
-}
-
-
-const LOG_ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
-
-function log(level: LogLevel, message: string, fields: Record<string, unknown> = {}): void {
-  if (LOG_ORDER[level] < LOG_ORDER[CONFIG.logLevel]) return;
-  // Pretty terminal output when enabled in config
-  if (CONFIG.prettyLogs) {
-    const ts = new Date().toISOString();
-    const colorMap: Record<LogLevel, string> = {
-      debug: "\x1b[36m", // cyan
-      info: "\x1b[32m", // green
-      warn: "\x1b[33m", // yellow
-      error: "\x1b[31m", // red
-    };
-    const reset = "\x1b[0m";
-
-    const fmtValue = (v: unknown): string => {
-      if (v === null) return "null";
-      if (v === undefined) return "undefined";
-      if (typeof v === "string") return v;
-      if (typeof v === "number" || typeof v === "boolean") return String(v);
-      try {
-        return JSON.stringify(v);
-      } catch {
-        return String(v as any);
-      }
-    };
-
-    const fieldsStr = Object.keys(fields).length
-      ? " " + Object.entries(fields).map(([k, v]) => `${k}=${fmtValue(v)}`).join(" ")
-      : "";
-
-    const levelLabel = level.toUpperCase();
-    const coloredLevel = (colorMap[level] || "") + levelLabel + reset;
-    const line = `[${ts}] ${coloredLevel} ${message}${fieldsStr}`;
-
-    if (level === "error") console.error(line);
-    else if (level === "warn") console.warn(line);
-    else console.log(line);
-    return;
-  }
-
-  // Default: compact JSON log lines for structured logging
-  const entry = {
-    ts: new Date().toISOString(),
-    level,
-    message,
-    ...fields,
-  };
-  const line = JSON.stringify(entry);
-  if (level === "error") console.error(line);
-  else if (level === "warn") console.warn(line);
-  else console.log(line);
 }
 
 function makeRequestId(): string {
