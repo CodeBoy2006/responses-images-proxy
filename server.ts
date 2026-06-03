@@ -12,11 +12,15 @@
 //
 // Multi-backend hedging:
 //   UPSTREAM_BACKENDS='[
-//     {"name":"a","base_url":"https://a.example.com","api_key":"sk-a"},
-//     {"name":"b","base_url":"https://b.example.com","api_key":"sk-b"}
+//     {"name":"a","base_url":"https://a.example.com","api_key":"sk-a","weight":3},
+//     {"name":"b","base_url":"https://b.example.com","api_key":"sk-b","weight":1}
 //   ]'
 //   # or: UPSTREAM_BASE_URLS="https://a.example.com,https://b.example.com"
 //   #     UPSTREAM_API_KEYS="sk-a,sk-b"
+//   #     UPSTREAM_WEIGHTS="3,1"
+//   # delimited entries also support a trailing weight:
+//   #     UPSTREAM_BACKENDS="a|https://a.example.com|sk-a|3;b|https://b.example.com|sk-b|1"
+//   # weight <= 0 disables that backend; omitted or invalid weights default to 1.
 //
 // Blank-image padding for fragile direct generation channels:
 //   IMAGE_BLANK_PADDING_ENABLED=true   # default true for /v1/images/generations
@@ -48,6 +52,7 @@ interface GeneratedImage {
   winningAttempt: number;
   raceGroup: number;
   upstreamName: string;
+  upstreamWeight: number;
   upstreamBaseUrl: string;
 }
 
@@ -172,6 +177,7 @@ interface UpstreamBackend {
   name: string;
   baseUrl: string;
   apiKey: string;
+  weight: number;
 }
 
 interface RuntimeInfo {
@@ -282,6 +288,11 @@ function clampInt(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Math.floor(value)));
 }
 
+const DEFAULT_UPSTREAM_BACKEND_WEIGHT = 1;
+const MAX_UPSTREAM_BACKEND_WEIGHT = 1000;
+const BACKEND_WEIGHT_UNIT_SCALE = 1000;
+const MAX_WEIGHTED_BACKEND_RING_SIZE = 4096;
+
 
 function detectRuntime(bindings = ACTIVE_ENV_BINDINGS): RuntimeInfo {
   const g = globalThis as any;
@@ -355,22 +366,73 @@ function backendField(record: Record<string, unknown>, ...names: string[]): stri
   return "";
 }
 
+function normalizeBackendWeight(value: unknown, fallback = DEFAULT_UPSTREAM_BACKEND_WEIGHT): number {
+  if (value == null || value === "") return fallback;
+  if (typeof value === "boolean") return value ? fallback : 0;
+
+  let raw = String(value).trim();
+  if (!raw) return fallback;
+
+  const tagged = /^(?:weight|w|ratio|traffic_weight|trafficWeight)\s*=\s*(.+)$/i.exec(raw);
+  if (tagged) raw = tagged[1].trim();
+
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  if (n <= 0) return 0;
+  return Math.min(n, MAX_UPSTREAM_BACKEND_WEIGHT);
+}
+
+function looksLikeWeightPart(value: string, allowBareNumber: boolean): boolean {
+  const s = value.trim();
+  if (!s) return false;
+  if (/^(?:weight|w|ratio|traffic_weight|trafficWeight)\s*=\s*[-+]?\d+(?:\.\d+)?$/i.test(s)) return true;
+  return allowBareNumber && /^[-+]?\d+(?:\.\d+)?$/.test(s);
+}
+
+function splitBackendSpecAndWeight(parts: string[]): { parts: string[]; weight: number } {
+  if (parts.length === 0) return { parts, weight: DEFAULT_UPSTREAM_BACKEND_WEIGHT };
+
+  const firstLooksLikeUrl = /^https?:\/\//i.test(parts[0] || "");
+  const allowBareNumber = parts.length >= 4 || (firstLooksLikeUrl && parts.length >= 3);
+  const last = parts[parts.length - 1] || "";
+
+  if (looksLikeWeightPart(last, allowBareNumber)) {
+    return {
+      parts: parts.slice(0, -1),
+      weight: normalizeBackendWeight(last, DEFAULT_UPSTREAM_BACKEND_WEIGHT),
+    };
+  }
+
+  return { parts, weight: DEFAULT_UPSTREAM_BACKEND_WEIGHT };
+}
+
 function pushUniqueBackend(list: UpstreamBackend[], backend: UpstreamBackend): void {
   if (!backend.baseUrl) return;
-  const duplicate = list.some((item) => item.baseUrl === backend.baseUrl && item.apiKey === backend.apiKey);
-  if (!duplicate) list.push(backend);
+  const normalized: UpstreamBackend = {
+    ...backend,
+    weight: normalizeBackendWeight(backend.weight, DEFAULT_UPSTREAM_BACKEND_WEIGHT),
+  };
+  const duplicate = list.some((item) => item.baseUrl === normalized.baseUrl && item.apiKey === normalized.apiKey);
+  if (!duplicate) list.push(normalized);
 }
 
 function parseBackendSpec(spec: string, fallbackApiKey: string, index: number): UpstreamBackend | undefined {
-  const parts = spec.split("|").map((part) => part.trim());
+  const split = splitBackendSpecAndWeight(spec.split("|").map((part) => part.trim()));
+  const parts = split.parts;
+  const weight = split.weight;
   let name = `upstream-${index + 1}`;
   let baseUrl = "";
   let apiKey = fallbackApiKey;
 
   if (parts.length >= 3) {
-    name = parts[0] || name;
-    baseUrl = normalizeBaseUrl(parts[1] || "");
-    apiKey = parts.slice(2).join("|").trim() || fallbackApiKey;
+    if (/^https?:\/\//i.test(parts[0])) {
+      baseUrl = normalizeBaseUrl(parts[0] || "");
+      apiKey = parts.slice(1).join("|").trim() || fallbackApiKey;
+    } else {
+      name = parts[0] || name;
+      baseUrl = normalizeBaseUrl(parts[1] || "");
+      apiKey = parts.slice(2).join("|").trim() || fallbackApiKey;
+    }
   } else if (parts.length === 2) {
     if (/^https?:\/\//i.test(parts[0])) {
       baseUrl = normalizeBaseUrl(parts[0]);
@@ -384,7 +446,7 @@ function parseBackendSpec(spec: string, fallbackApiKey: string, index: number): 
   }
 
   if (!baseUrl) return undefined;
-  return { name, baseUrl, apiKey };
+  return { name, baseUrl, apiKey, weight };
 }
 
 function parseUpstreamBackends(legacyBaseUrl: string, legacyApiKey: string): UpstreamBackend[] {
@@ -408,7 +470,11 @@ function parseUpstreamBackends(legacyBaseUrl: string, legacyApiKey: string): Ups
               const name = backendField(record, "name", "id", "label") || `upstream-${index + 1}`;
               const baseUrl = normalizeBaseUrl(backendField(record, "base_url", "baseUrl", "url", "endpoint"));
               const apiKey = backendField(record, "api_key", "apiKey", "key", "token") || legacyApiKey;
-              if (baseUrl) pushUniqueBackend(backends, { name, baseUrl, apiKey });
+              const weight = normalizeBackendWeight(
+                record.weight ?? record.w ?? record.ratio ?? record.traffic_weight ?? record.trafficWeight,
+                DEFAULT_UPSTREAM_BACKEND_WEIGHT,
+              );
+              if (baseUrl) pushUniqueBackend(backends, { name, baseUrl, apiKey, weight });
             }
           });
         }
@@ -430,6 +496,7 @@ function parseUpstreamBackends(legacyBaseUrl: string, legacyApiKey: string): Ups
   const baseUrls = envList(env("UPSTREAM_BASE_URLS", env("IMAGE_UPSTREAM_BASE_URLS", "")));
   const apiKeys = envList(env("UPSTREAM_API_KEYS", env("IMAGE_UPSTREAM_API_KEYS", "")));
   const names = envList(env("UPSTREAM_NAMES", env("IMAGE_UPSTREAM_NAMES", "")));
+  const weights = envList(env("UPSTREAM_WEIGHTS", env("IMAGE_UPSTREAM_WEIGHTS", env("UPSTREAM_BACKEND_WEIGHTS", env("IMAGE_UPSTREAM_BACKEND_WEIGHTS", "")))));
 
   baseUrls.forEach((base, index) => {
     const baseUrl = normalizeBaseUrl(base);
@@ -438,6 +505,7 @@ function parseUpstreamBackends(legacyBaseUrl: string, legacyApiKey: string): Ups
       name: names[index] || `upstream-${index + 1}`,
       baseUrl,
       apiKey: apiKeys[index] || apiKeys[0] || legacyApiKey,
+      weight: normalizeBackendWeight(weights[index], DEFAULT_UPSTREAM_BACKEND_WEIGHT),
     });
   });
 
@@ -446,6 +514,7 @@ function parseUpstreamBackends(legacyBaseUrl: string, legacyApiKey: string): Ups
       name: env("UPSTREAM_NAME", "primary").trim() || "primary",
       baseUrl: legacyBaseUrl,
       apiKey: legacyApiKey,
+      weight: normalizeBackendWeight(env("UPSTREAM_WEIGHT", env("IMAGE_UPSTREAM_WEIGHT", "")), DEFAULT_UPSTREAM_BACKEND_WEIGHT),
     });
   }
 
@@ -461,12 +530,71 @@ function hashString(input: string): number {
   return h >>> 0;
 }
 
+function gcd(a: number, b: number): number {
+  a = Math.abs(Math.trunc(a));
+  b = Math.abs(Math.trunc(b));
+  while (b !== 0) {
+    const t = b;
+    b = a % b;
+    a = t;
+  }
+  return a || 1;
+}
+
+function buildWeightedBackendRing(backends: UpstreamBackend[]): UpstreamBackend[] {
+  const active = backends.filter((backend) => normalizeBackendWeight(backend.weight, DEFAULT_UPSTREAM_BACKEND_WEIGHT) > 0);
+  if (active.length === 0) return [];
+
+  let units = active.map((backend) => Math.max(0, Math.round(normalizeBackendWeight(backend.weight, DEFAULT_UPSTREAM_BACKEND_WEIGHT) * BACKEND_WEIGHT_UNIT_SCALE)));
+  let divisor = units.find((unit) => unit > 0) || 1;
+  for (const unit of units) {
+    if (unit > 0) divisor = gcd(divisor, unit);
+  }
+  units = units.map((unit) => unit === 0 ? 0 : Math.max(1, Math.floor(unit / divisor)));
+
+  let total = units.reduce((sum, unit) => sum + unit, 0);
+  if (total > MAX_WEIGHTED_BACKEND_RING_SIZE) {
+    const scale = total / MAX_WEIGHTED_BACKEND_RING_SIZE;
+    units = units.map((unit) => unit === 0 ? 0 : Math.max(1, Math.round(unit / scale)));
+    total = units.reduce((sum, unit) => sum + unit, 0);
+  }
+
+  const current = units.map(() => 0);
+  const ring: UpstreamBackend[] = [];
+
+  for (let slot = 0; slot < total; slot++) {
+    let winner = -1;
+    let best = Number.NEGATIVE_INFINITY;
+
+    for (let i = 0; i < active.length; i++) {
+      if (units[i] <= 0) continue;
+      current[i] += units[i];
+      if (current[i] > best) {
+        best = current[i];
+        winner = i;
+      }
+    }
+
+    if (winner < 0) break;
+    current[winner] -= total;
+    ring.push(active[winner]);
+  }
+
+  return ring.length > 0 ? ring : active;
+}
+
 function pickBackendForAttempt(backends: UpstreamBackend[], requestId: string, attempt: number): UpstreamBackend {
   if (backends.length === 0) {
     throw new HttpError(500, "No upstream backend is configured", "configuration_error", "missing_upstream_backend");
   }
-  const offset = hashString(requestId) % backends.length;
-  return backends[(offset + attempt - 1) % backends.length];
+
+  const ring = buildWeightedBackendRing(backends);
+  if (ring.length === 0) {
+    throw new HttpError(500, "All upstream backends are disabled by weight", "configuration_error", "all_upstream_backends_disabled");
+  }
+
+  const offset = hashString(requestId) % ring.length;
+  return ring[(offset + attempt - 1) % ring.length];
 }
 
 function buildConfig(): AppConfig {
@@ -714,14 +842,15 @@ function resolveUpstreamBackends(req: Request): UpstreamBackend[] {
   const configured = CONFIG.upstreamBackends.length > 0
     ? CONFIG.upstreamBackends
     : CONFIG.upstreamBaseUrl
-      ? [{ name: "primary", baseUrl: CONFIG.upstreamBaseUrl, apiKey: CONFIG.upstreamApiKey }]
+      ? [{ name: "primary", baseUrl: CONFIG.upstreamBaseUrl, apiKey: CONFIG.upstreamApiKey, weight: DEFAULT_UPSTREAM_BACKEND_WEIGHT }]
       : [];
 
   const resolved = configured.map((backend, index) => ({
     name: backend.name || `upstream-${index + 1}`,
     baseUrl: backend.baseUrl,
     apiKey: backend.apiKey || fallbackApiKey,
-  })).filter((backend) => backend.baseUrl);
+    weight: normalizeBackendWeight(backend.weight, DEFAULT_UPSTREAM_BACKEND_WEIGHT),
+  })).filter((backend) => backend.baseUrl && backend.weight > 0);
 
   const missingKey = resolved.find((backend) => !backend.apiKey);
   if (missingKey) {
@@ -732,7 +861,7 @@ function resolveUpstreamBackends(req: Request): UpstreamBackend[] {
   }
 
   if (resolved.length === 0) {
-    throw new HttpError(500, "No usable upstream backend is configured", "configuration_error", "missing_upstream_backend");
+    throw new HttpError(500, "No usable upstream backend is configured; all configured backends may be missing base_url or disabled by weight", "configuration_error", "missing_upstream_backend");
   }
 
   return resolved;
@@ -1867,6 +1996,7 @@ async function callUpstreamOnce(params: {
     attempt: params.attempt,
     url,
     backend: params.backend.name,
+    backend_weight: params.backend.weight,
     timeout_ms: CONFIG.upstreamTimeoutMs,
   });
 
@@ -1884,6 +2014,7 @@ async function callUpstreamOnce(params: {
       json_path: extracted.path,
       partial_images_seen: partialImageCount,
       backend: params.backend.name,
+      backend_weight: params.backend.weight,
     });
 
     return {
@@ -1896,6 +2027,7 @@ async function callUpstreamOnce(params: {
       winningAttempt: params.attempt,
       raceGroup: params.raceGroup,
       upstreamName: params.backend.name,
+      upstreamWeight: params.backend.weight,
       upstreamBaseUrl: params.backend.baseUrl,
     };
   };
@@ -2058,6 +2190,8 @@ async function raceUpstreamImage(params: {
           image_bytes: image.bytes.byteLength,
           upstream_elapsed_ms: image.upstreamElapsedMs,
           upstream_events: image.upstreamEventCount,
+          upstream_backend: image.upstreamName,
+          upstream_backend_weight: image.upstreamWeight,
         });
 
         resolve(image);
@@ -2185,6 +2319,8 @@ async function collectLenientUpstreamImages(params: {
                 image_bytes: image.bytes.byteLength,
                 upstream_elapsed_ms: image.upstreamElapsedMs,
                 upstream_events: image.upstreamEventCount,
+                upstream_backend: image.upstreamName,
+                upstream_backend_weight: image.upstreamWeight,
               });
             }
           } catch (err) {
@@ -2236,6 +2372,7 @@ async function handleImageEndpoint(req: Request, mode: "generation" | "edit" | "
     method: req.method,
     path: new URL(req.url).pathname,
     upstream_backends: upstreamBackends.map((backend) => backend.name),
+    upstream_backend_weights: upstreamBackends.map((backend) => ({ name: backend.name, weight: backend.weight })),
     ...parsed.rawBodyForLog,
   });
 
@@ -2268,6 +2405,7 @@ async function handleImageEndpoint(req: Request, mode: "generation" | "edit" | "
     item.mime_type = image.mime;
     item.size_bytes = image.bytes.byteLength;
     item.upstream_backend = image.upstreamName;
+    item.upstream_backend_weight = image.upstreamWeight;
     item.revised_prompt = parsed.prompt;
 
     data.push(item);
@@ -2284,6 +2422,7 @@ async function handleImageEndpoint(req: Request, mode: "generation" | "edit" | "
     candidate_count: parsed.candidateCount,
     upstream_concurrency: parsed.upstreamConcurrency,
     upstream_backends: upstreamBackends.map((backend) => backend.name),
+    upstream_backend_weights: upstreamBackends.map((backend) => ({ name: backend.name, weight: backend.weight })),
     stopped_reason: batch.stoppedReason,
     attempts_started: batch.attemptsStarted,
     attempts_completed: batch.attemptsCompleted,
@@ -2307,6 +2446,7 @@ async function handleImageEndpoint(req: Request, mode: "generation" | "edit" | "
       active_aborted: batch.activeAborted,
       upstream_concurrency: parsed.upstreamConcurrency,
       upstream_backends: upstreamBackends.map((backend) => backend.name),
+      upstream_backend_weights: upstreamBackends.map((backend) => ({ name: backend.name, weight: backend.weight })),
       stopped_reason: batch.stoppedReason,
       failure_reasons: batch.failures.slice(0, 20),
     },
@@ -2338,6 +2478,7 @@ async function handleResponsesProxy(req: Request, requestId: string): Promise<Re
     request_id: requestId,
     upstream_status: resp.status,
     upstream_backend: backend.name,
+    upstream_backend_weight: backend.weight,
     content_type: resp.headers.get("content-type") || "",
   });
 
@@ -2349,6 +2490,7 @@ async function handleResponsesProxy(req: Request, requestId: string): Promise<Re
       "cache-control": resp.headers.get("cache-control") || "no-cache",
       "x-request-id": requestId,
       "x-upstream-backend": backend.name,
+      "x-upstream-backend-weight": String(backend.weight),
     },
   });
 }
@@ -2368,6 +2510,7 @@ async function handleModels(req: Request, requestId: string): Promise<Response> 
     request_id: requestId,
     upstream_status: resp.status,
     upstream_backend: backend.name,
+    upstream_backend_weight: backend.weight,
     bytes: body.length,
   });
 
